@@ -1,6 +1,8 @@
-const MODEL = "gemini-2.5-flash";
 
-function response(data, status = 200) {
+const GEMINI_MODEL = "gemini-2.5-flash";
+const CLOUDFLARE_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+
+function reply(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -12,28 +14,50 @@ function response(data, status = 200) {
   });
 }
 
+function makeCompletion(text, model) {
+  return {
+    id: "chatcmpl-" + crypto.randomUUID(),
+    object: "chat.completion",
+    model: "abu-nemer-gpt",
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: text },
+      finish_reason: "stop"
+    }],
+    provider: model
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204 });
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+        }
+      });
     }
 
     if (url.pathname === "/health") {
-      return response({
+      return reply({
         status: "running",
-        name: "GPT أبو نمر 👑"
+        name: "GPT أبو نمر 👑",
+        providers: ["Gemini", "Cloudflare Workers AI"]
       });
     }
 
     if (!env.API_TOKEN ||
         request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`) {
-      return response({ error: "مفتاح الدخول غير صحيح" }, 401);
+      return reply({ error: "مفتاح الدخول غير صحيح" }, 401);
     }
 
     if (url.pathname === "/v1/models") {
-      return response({
+      return reply({
         object: "list",
         data: [{ id: "abu-nemer-gpt", object: "model" }]
       });
@@ -41,103 +65,127 @@ export default {
 
     if (url.pathname !== "/v1/chat/completions" ||
         request.method !== "POST") {
-      return response({ error: "المسار غير موجود" }, 404);
-    }
-
-    if (!env.GEMINI_API_KEY) {
-      return response({ error: "مفتاح Gemini غير مضبوط" }, 503);
+      return reply({ error: "المسار غير موجود" }, 404);
     }
 
     let body;
     try {
       body = await request.json();
     } catch {
-      return response({ error: "بيانات الطلب غير صحيحة" }, 400);
+      return reply({ error: "بيانات الطلب غير صحيحة" }, 400);
     }
 
-    if (!Array.isArray(body.messages)) {
-      return response({ error: "messages مطلوبة" }, 400);
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return reply({ error: "messages مطلوبة" }, 400);
     }
 
-    const system = [];
-    const contents = [];
+    const messages = [{
+      role: "system",
+      content: "أنت GPT أبو نمر 👑، مساعد ذكي ومفيد ومحترم. أجب بالعربية افتراضياً وباللهجة السورية البسيطة عندما يناسب السياق. ساعد في البرمجة والتقنية والدين والمعرفة العامة. كن واضحاً وصادقاً ولا تخترع معلومات."
+    }];
 
     for (const msg of body.messages) {
       if (!msg || typeof msg.content !== "string") continue;
 
       if (msg.role === "system" || msg.role === "developer") {
-        system.push(msg.content);
-      } else if (msg.role === "user") {
-        contents.push({
-          role: "user",
-          parts: [{ text: msg.content }]
-        });
-      } else if (msg.role === "assistant") {
-        contents.push({
-          role: "model",
-          parts: [{ text: msg.content }]
+        messages[0].content += "\n\n" + msg.content;
+      } else if (msg.role === "user" || msg.role === "assistant") {
+        messages.push({
+          role: msg.role,
+          content: msg.content
         });
       }
     }
 
-    if (!contents.length) {
-      return response({ error: "لا توجد رسالة صالحة" }, 400);
+    if (!messages.some(m => m.role === "user")) {
+      return reply({ error: "لا توجد رسالة مستخدم صالحة" }, 400);
     }
 
-    const model = env.GEMINI_MODEL || MODEL;
-    const endpoint =
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+    const maxTokens = Number.isFinite(body.max_tokens)
+      ? Math.max(1, Math.min(2048, body.max_tokens))
+      : 1024;
 
-    const payload = { contents };
+    const temperature = Number.isFinite(body.temperature)
+      ? Math.max(0, Math.min(2, body.temperature))
+      : 0.7;
 
-    if (system.length) {
-      payload.systemInstruction = {
-        parts: [{ text: system.join("\n\n") }]
-      };
-    }
+    // المحاولة الأولى: Gemini
+    if (env.GEMINI_API_KEY) {
+      try {
+        const contents = messages
+          .filter(m => m.role !== "system")
+          .map(m => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content }]
+          }));
 
-    if (Number.isFinite(body.temperature)) {
-      payload.generationConfig = {
-        temperature: Math.max(0, Math.min(2, body.temperature))
-      };
-    }
+        const geminiPayload = {
+          contents,
+          systemInstruction: {
+            parts: [{ text: messages[0].content }]
+          },
+          generationConfig: {
+            temperature,
+            maxOutputTokens: maxTokens
+          }
+        };
 
-    let result;
+        const upstream = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": env.GEMINI_API_KEY
+            },
+            body: JSON.stringify(geminiPayload),
+            signal: AbortSignal.timeout(25000)
+          }
+        );
 
-    try {
-      const upstream = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+        if (upstream.ok) {
+          const result = await upstream.json();
+          const answer = (result.candidates?.[0]?.content?.parts || [])
+            .map(part => part.text || "")
+            .join("");
 
-      result = await upstream.json();
-
-      if (!upstream.ok) {
-        return response({
-          error: result.error?.message || "خطأ من Gemini"
-        }, 502);
+          if (answer.trim()) {
+            return reply(makeCompletion(answer, "Gemini"));
+          }
+        }
+      } catch (error) {
+        // عند فشل Gemini ننتقل للمزوّد الاحتياطي
       }
-    } catch {
-      return response({ error: "تعذر الاتصال بـ Gemini" }, 502);
     }
 
-    const answer = (result.candidates?.[0]?.content?.parts || [])
-      .map(part => part.text || "")
-      .join("");
+    // المحاولة الثانية: Cloudflare Workers AI
+    if (env.AI) {
+      try {
+        const result = await env.AI.run(CLOUDFLARE_MODEL, {
+          messages,
+          temperature,
+          max_completion_tokens: maxTokens
+        });
 
-    return response({
-      id: "chatcmpl-" + crypto.randomUUID(),
-      object: "chat.completion",
-      model: "abu-nemer-gpt",
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: answer || "لم يصل رد من Gemini"
-        },
-        finish_reason: "stop"
-      }]
-    });
+        const answer =
+          result?.choices?.[0]?.message?.content ||
+          result?.response ||
+          result?.result?.response ||
+          "";
+
+        if (typeof answer === "string" && answer.trim()) {
+          return reply(makeCompletion(answer, "Cloudflare AI"));
+        }
+      } catch (error) {
+        return reply({
+          error: "تعذر الرد من Gemini وCloudflare حالياً",
+          detail: String(error?.message || error).slice(0, 250)
+        }, 503);
+      }
+    }
+
+    return reply({
+      error: "لم يتمكن أي مزوّد من الرد. تحقق من المفاتيح والحصص."
+    }, 503);
   }
 };
