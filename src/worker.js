@@ -14,18 +14,27 @@ function reply(data, status = 200) {
   });
 }
 
-function makeCompletion(text, model) {
+function makeCompletion(text, provider) {
   return {
     id: "chatcmpl-" + crypto.randomUUID(),
     object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
     model: "abu-nemer-gpt",
     choices: [{
       index: 0,
-      message: { role: "assistant", content: text },
+      message: {
+        role: "assistant",
+        content: text
+      },
       finish_reason: "stop"
     }],
-    provider: model
+    provider
   };
+}
+
+function getToken(request) {
+  const authorization = request.headers.get("Authorization") || "";
+  return authorization.replace(/^\s*Bearer\s+/i, "").trim();
 }
 
 export default {
@@ -51,15 +60,22 @@ export default {
       });
     }
 
-    if (!env.API_TOKEN ||
-        request.headers.get("Authorization") !== `Bearer ${env.API_TOKEN}`) {
+    const expectedToken = String(env.API_TOKEN || "").trim();
+    const suppliedToken = getToken(request);
+
+    if (!expectedToken || !suppliedToken ||
+        suppliedToken !== expectedToken) {
       return reply({ error: "مفتاح الدخول غير صحيح" }, 401);
     }
 
-    if (url.pathname === "/v1/models") {
+    if (url.pathname === "/v1/models" && request.method === "GET") {
       return reply({
         object: "list",
-        data: [{ id: "abu-nemer-gpt", object: "model" }]
+        data: [{
+          id: "abu-nemer-gpt",
+          object: "model",
+          owned_by: "abu-nemer"
+        }]
       });
     }
 
@@ -69,6 +85,7 @@ export default {
     }
 
     let body;
+
     try {
       body = await request.json();
     } catch {
@@ -79,9 +96,18 @@ export default {
       return reply({ error: "messages مطلوبة" }, 400);
     }
 
+    const systemPrompt = [
+      "أنت GPT أبو نمر 👑، مساعد ذكي ومفيد ومحترم.",
+      "أجب باللغة العربية افتراضياً وباللهجة السورية البسيطة عندما يناسب السياق.",
+      "ساعد في البرمجة والتقنية والدين والرياضة والمعرفة العامة.",
+      "اشرح للمبتدئين خطوة بخطوة وبوضوح.",
+      "لا تخترع معلومات، وإذا لم تعرف الإجابة فقل ذلك بصراحة.",
+      "لا تدّعِ تنفيذ أي إجراء لم تنفذه فعلاً."
+    ].join(" ");
+
     const messages = [{
       role: "system",
-      content: "أنت GPT أبو نمر 👑، مساعد ذكي ومفيد ومحترم. أجب بالعربية افتراضياً وباللهجة السورية البسيطة عندما يناسب السياق. ساعد في البرمجة والتقنية والدين والمعرفة العامة. كن واضحاً وصادقاً ولا تخترع معلومات."
+      content: systemPrompt
     }];
 
     for (const msg of body.messages) {
@@ -97,7 +123,7 @@ export default {
       }
     }
 
-    if (!messages.some(m => m.role === "user")) {
+    if (!messages.some(msg => msg.role === "user")) {
       return reply({ error: "لا توجد رسالة مستخدم صالحة" }, 400);
     }
 
@@ -113,22 +139,11 @@ export default {
     if (env.GEMINI_API_KEY) {
       try {
         const contents = messages
-          .filter(m => m.role !== "system")
-          .map(m => ({
-            role: m.role === "assistant" ? "model" : "user",
-            parts: [{ text: m.content }]
+          .filter(msg => msg.role !== "system")
+          .map(msg => ({
+            role: msg.role === "assistant" ? "model" : "user",
+            parts: [{ text: msg.content }]
           }));
-
-        const geminiPayload = {
-          contents,
-          systemInstruction: {
-            parts: [{ text: messages[0].content }]
-          },
-          generationConfig: {
-            temperature,
-            maxOutputTokens: maxTokens
-          }
-        };
 
         const upstream = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
@@ -138,14 +153,26 @@ export default {
               "Content-Type": "application/json",
               "x-goog-api-key": env.GEMINI_API_KEY
             },
-            body: JSON.stringify(geminiPayload),
+            body: JSON.stringify({
+              contents,
+              systemInstruction: {
+                parts: [{ text: messages[0].content }]
+              },
+              generationConfig: {
+                temperature,
+                maxOutputTokens: maxTokens
+              }
+            }),
             signal: AbortSignal.timeout(25000)
           }
         );
 
         if (upstream.ok) {
           const result = await upstream.json();
-          const answer = (result.candidates?.[0]?.content?.parts || [])
+
+          const answer = (
+            result.candidates?.[0]?.content?.parts || []
+          )
             .map(part => part.text || "")
             .join("");
 
@@ -154,7 +181,7 @@ export default {
           }
         }
       } catch (error) {
-        // عند فشل Gemini ننتقل للمزوّد الاحتياطي
+        // الانتقال إلى المزوّد الاحتياطي
       }
     }
 
